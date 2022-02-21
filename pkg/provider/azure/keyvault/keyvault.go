@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/profiles/latest/keyvault/keyvault"
@@ -51,20 +52,21 @@ const (
 	annotationClientID   = "azure.workload.identity/client-id"
 	annotationTenantID   = "azure.workload.identity/tenant-id"
 
-	errUnexpectedStoreSpec   = "unexpected store spec"
-	errMissingAuthType       = "cannot initialize Azure Client: no valid authType was specified"
-	errPropNotExist          = "property %s does not exist in key %s"
-	errUnknownObjectType     = "unknown Azure Keyvault object Type for %s"
-	errUnmarshalJSONData     = "error unmarshalling json data: %w"
-	errDataFromCert          = "cannot get use dataFrom to get certificate secret"
-	errDataFromKey           = "cannot get use dataFrom to get key secret"
-	errMissingTenant         = "missing tenantID in store config"
-	errMissingSecretRef      = "missing secretRef in provider config"
-	errMissingClientIDSecret = "missing accessKeyID/secretAccessKey in store config"
-	errFindSecret            = "could not find secret %s/%s: %w"
-	errFindDataKey           = "no data for %q in secret '%s/%s'"
-	errMissingServiceAccRef  = "missing serviceAccountRef"
-	errMissingSAAnnotation   = "missing service account annotation: %s"
+	errUnexpectedStoreSpec    = "unexpected store spec"
+	errMissingAuthType        = "cannot initialize Azure Client: no valid authType was specified"
+	errPropNotExist           = "property %s does not exist in key %s"
+	errUnknownObjectType      = "unknown Azure Keyvault object Type for %s"
+	errUnmarshalJSONData      = "error unmarshalling json data: %w"
+	errDataFromCert           = "cannot get use dataFrom to get certificate secret"
+	errDataFromKey            = "cannot get use dataFrom to get key secret"
+	errMissingTenant          = "missing tenantID in store config"
+	errMissingSecretRef       = "missing secretRef in provider config"
+	errMissingClientIDSecret  = "missing accessKeyID/secretAccessKey in store config"
+	errFindSecret             = "could not find secret %s/%s: %w"
+	errFindDataKey            = "no data for %q in secret '%s/%s'"
+	errMissingWorkloadEnvVars = "missing environment variables. AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_FEDERATED_TOKEN_FILE must be set"
+	errReadTokenFile          = "unable to read token file %s: %w"
+	errMissingSAAnnotation    = "missing service account annotation: %s"
 )
 
 // interface to keyvault.BaseClient.
@@ -227,8 +229,25 @@ func (a *Azure) GetSecretMap(ctx context.Context, ref esv1alpha1.ExternalSecretD
 }
 
 func (a *Azure) authorizerForWorkloadIdentity(ctx context.Context, tokenProvider tokenProviderFunc) (autorest.Authorizer, error) {
+	// if no serviceAccountRef was provided
+	// we expect certain env vars to be present.
+	// They are set by the azure workload identity webhook.
 	if a.provider.ServiceAccountRef == nil {
-		return nil, fmt.Errorf(errMissingServiceAccRef)
+		clientID := os.Getenv("AZURE_CLIENT_ID")
+		tenantID := os.Getenv("AZURE_TENANT_ID")
+		tokenFilePath := os.Getenv("AZURE_FEDERATED_TOKEN_FILE")
+		if clientID == "" || tenantID == "" || tokenFilePath == "" {
+			return nil, errors.New(errMissingWorkloadEnvVars)
+		}
+		token, err := os.ReadFile(tokenFilePath)
+		if err != nil {
+			return nil, fmt.Errorf(errReadTokenFile, tokenFilePath, err)
+		}
+		tp, err := tokenProvider(ctx, string(token), clientID, tenantID)
+		if err != nil {
+			return nil, err
+		}
+		return autorest.NewBearerAuthorizer(tp), nil
 	}
 	ns := a.namespace
 	if a.store.GetObjectKind().GroupVersionKind().Kind == esv1alpha1.ClusterSecretStoreKind {
@@ -286,6 +305,9 @@ func newTokenProvider(ctx context.Context, token, clientID, tenantID string) (ad
 	if err != nil {
 		return nil, err
 	}
+
+	// AZURE_AUTHORITY_HOST
+
 	cClient, err := confidential.New(clientID, cred, confidential.WithAuthority(
 		fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/token", tenantID),
 	))
